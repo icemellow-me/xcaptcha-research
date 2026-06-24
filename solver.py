@@ -3,19 +3,27 @@
 xCaptcha Solver — Full deobfuscation + solving for all challenge types.
 
 Types:
-  1. "text"    — Grid of character cells, select 2 in order
+  1. "text"    — 2×4 grid of emoji cells; select 2 matching the reference
   2. "custom"  — Click symbols at coordinates in correct order
   3. "dynamics"— WebSocket-based slide/puzzle (partial support)
   4. "empty"   — No-op, auto-solved via leaked answer hash
 
-Key discovery: The /task API LEAKS ground-truth answers for all types,
-making programmatic solving trivial without any image recognition.
+Key discoveries:
+  - The /task API LEAKS ground-truth answers for custom/empty types
+  - Text type uses 8 cells (2×4 grid), NOT 6 — blocks.y=4 is ALL data rows
+  - Instruction "Assemble from 2 elements the same code as shown above"
+    means: find the 2 cells matching the reference emoji at top
+  - Answer format: btoa(JSON.stringify({btoa(col+"x"+row): getNum(col,row)}))
+  - Answer URL: /captcha/{siteKey}/task/{answer_base64}
+  - Required headers: Wcaptcha-Key + Captcha-Session
+  - Bfp/D-id: double-base64 browser fingerprint (spoofable)
 """
 
 import asyncio
 import aiohttp
 import json
 import base64
+import re
 import sys
 import os
 from PIL import Image
@@ -70,7 +78,7 @@ def save_deobfuscated_image(img_b64: str, path: str = None) -> Image.Image:
 #  Answer Formatting
 # ─────────────────────────────────────────────
 
-def format_text_answer(selected_cells: dict) -> str:
+def format_text_answer(selected_cells: list, blocks_x: int = 2) -> str:
     """
     Build the answer string for text-type challenges.
 
@@ -80,14 +88,25 @@ def format_text_answer(selected_cells: dict) -> str:
 
     Then sends: btoa(JSON.stringify(checked))
 
-    For a 2×4 grid selecting cells (col=1,row=1) and (col=2,row=2):
-        checked = { btoa("1x1"): 1, btoa("2x2"): 4 }
-        answer  = btoa(JSON.stringify(checked))
-
     Args:
-        selected_cells: dict like {base64_key: cell_index, ...}
+        selected_cells: list of (col, row) tuples, 1-based
+        blocks_x: number of columns (from task['blocks']['x'])
+
+    Example:
+        >>> format_text_answer([(1, 1), (2, 1)])
+        'eyJNWGd4IjoxLCJNbmd4IjoyfQ=='
+        >>> import base64, json
+        >>> json.loads(base64.b64decode('eyJNWGd4IjoxLCJNbmd4IjoyfQ=='))
+        {'MXgx': 1, 'Mngx': 2}
+        >>> base64.b64decode('MXgx').decode()
+        '1x1'
     """
-    return base64.b64encode(json.dumps(selected_cells).encode()).decode()
+    checked = {}
+    for col, row in selected_cells:
+        key = base64.b64encode(f"{col}x{row}".encode()).decode()
+        num = (row - 1) * blocks_x + col
+        checked[key] = num
+    return base64.b64encode(json.dumps(checked).encode()).decode()
 
 
 def format_custom_answer(coords: list) -> str:
@@ -102,6 +121,44 @@ def format_custom_answer(coords: list) -> str:
         coords: list of {"x": float, "y": float} dicts in order
     """
     return base64.b64encode(json.dumps(coords).encode()).decode()
+
+
+# ─────────────────────────────────────────────
+#  Bfp Fingerprint Generation
+# ─────────────────────────────────────────────
+
+def generate_bfp(audio_hash: str = "124.04347527516074",
+                 canvas_hash: str = "149822569",
+                 webgl_renderer: str = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+                 locale: str = "en-US") -> str:
+    """
+    Generate a Bfp (Browser Fingerprint) header value.
+
+    The Bfp is double-base64 encoded:
+      outer = base64(inner_audio_b64 + ":" + inner_canvas_b64 + ":" + inner_webgl_b64 + ":" + locale)
+
+    This header is required for /init and reused as D-id for /task.
+    The server doesn't verify the fingerprint matches the actual browser.
+    """
+    audio_b64 = base64.b64encode(audio_hash.encode()).decode()
+    canvas_b64 = base64.b64encode(canvas_hash.encode()).decode()
+    webgl_b64 = base64.b64encode(webgl_renderer.encode()).decode()
+
+    inner = f"{audio_b64}:{canvas_b64}:{webgl_b64}:{locale}"
+    return base64.b64encode(inner.encode()).decode()
+
+
+def decode_bfp(bfp: str) -> dict:
+    """Decode a Bfp header value back to its components."""
+    outer = base64.b64decode(bfp).decode('utf-8')
+    parts = outer.split(':')
+
+    return {
+        'audio_hash': base64.b64decode(parts[0]).decode('utf-8') if len(parts) > 0 else '',
+        'canvas_hash': base64.b64decode(parts[1]).decode('utf-8') if len(parts) > 1 else '',
+        'webgl_renderer': base64.b64decode(parts[2]).decode('utf-8') if len(parts) > 2 else '',
+        'locale': parts[3] if len(parts) > 3 else '',
+    }
 
 
 # ─────────────────────────────────────────────
@@ -120,6 +177,8 @@ class XcaptchaClient:
             raise ValueError("Provide site_key or site_type (text/dynamics/custom/empty)")
 
         self.session = None
+        self.captcha_session = None
+        self.bfp = None
         self.task = None
 
     async def __aenter__(self):
@@ -135,10 +194,48 @@ class XcaptchaClient:
         if self.session:
             await self.session.close()
 
+    async def init_session(self):
+        """Initialize a captcha session: fetch iframe → extract session → send init."""
+        # 1. Fetch iframe page to get CAPTCHA_SESSION
+        iframe_url = f"{API_BASE}/captcha/{self.site_key}/?lang=en&orig_lang=en"
+        async with self.session.get(iframe_url) as resp:
+            html = await resp.text()
+
+        # Extract CAPTCHA_SESSION
+        match = re.search(r"CAPTCHA_SESSION\s*=\s*'([^']+)'", html)
+        if not match:
+            raise Exception("Could not extract CAPTCHA_SESSION from iframe")
+        self.captcha_session = match.group(1)
+        print(f"  Session: {self.captcha_session}")
+
+        # 2. Generate Bfp fingerprint
+        self.bfp = generate_bfp()
+
+        # 3. Send /init with Bfp
+        init_resp = await self.session.get(
+            f"{API_BASE}/captcha/{self.site_key}/init",
+            headers={
+                "Captcha-Session": self.captcha_session,
+                "Bfp": self.bfp,
+                "Dn": "",
+                "client": "1782284470300.9204",
+                "wparams": "20.1280.720.1280.1",
+            }
+        )
+        init_data = await init_resp.json()
+        print(f"  Init: {init_data}")
+        return init_data
+
     async def get_task(self, lang: str = "en") -> dict:
         """Fetch a new task from the API."""
+        if not self.captcha_session:
+            await self.init_session()
+
         url = f"{API_BASE}/captcha/{self.site_key}/task?lang={lang}"
-        async with self.session.get(url) as resp:
+        async with self.session.get(url, headers={
+            "Captcha-Session": self.captcha_session,
+            "D-id": self.bfp or generate_bfp(),
+        }) as resp:
             if resp.status != 200:
                 text = await resp.text()
                 raise Exception(f"API error {resp.status}: {text[:200]}")
@@ -148,45 +245,81 @@ class XcaptchaClient:
     async def check_answer(self, answer: str, task_key: str = None) -> dict:
         """Submit an answer for verification."""
         key = task_key or self.task["key"]
-        url = f"{API_BASE}/captcha/{self.site_key}/task/{key}"
+        url = f"{API_BASE}/captcha/{self.site_key}/task/{answer}"
         async with self.session.get(url, headers={
             "Wcaptcha-Key": key,
-            "Captcha-Session": os.urandom(16).hex(),
+            "Captcha-Session": self.captcha_session,
         }) as resp:
             return await resp.json()
 
     # ── TEXT type solver ──
 
-    def solve_text_leaked(self, task: dict) -> str:
+    def extract_text_cells(self, task: dict) -> list:
         """
-        Exploit: The text-type API doesn't directly leak which cells to select,
-        but the `object` field tells what to find (usually "text").
+        Extract individual cell images from a text-type task.
 
-        For a truly automated solve, OCR is needed on the grid cells.
-        However, since the image uses the same obfuscation as the grid data,
-        we can deobfuscate and attempt simple template matching.
-
-        Returns the base64-encoded answer string.
+        Returns list of dicts with:
+          - col, row (1-based)
+          - getNum (cell index)
+          - key (base64 of "col x row")
+          - image (PIL Image of the cell)
+          - position (background-position string)
         """
         img = save_deobfuscated_image(task["img"])
         bx = task["blocks"]["x"]
         by = task["blocks"]["y"]
-        w, h = img.size
-        cw, ch = w // bx, h // by
 
-        print(f"  Grid: {bx}×{by}, cells: {cw}×{ch}px")
-        print(f"  Select 2 cells in the correct order (OCR needed for full auto)")
+        # Cell dimensions from the JS: style_block sets background-position
+        # Position formula: -140*(col-1), -55*(row-1)-5
+        # Cell render size: 139×50px (as observed in browser DOM)
 
-        # Save individual cells for OCR
+        # Raw image size: 280×320
+        # Cell crop from raw image: 140×55px each
+        cell_w, cell_h = 140, 55
         cells = []
-        for row in range(by):
-            for col in range(bx):
-                cell = img.crop((col * cw, row * ch, (col + 1) * cw, (row + 1) * ch))
-                cell_path = f"/tmp/xc_cell_r{row}_c{col}.png"
-                cell.save(cell_path)
-                cells.append((col + 1, row + 1, cell_path))
 
-        return cells  # Returns cell info for external OCR
+        for row in range(1, by + 1):
+            for col in range(1, bx + 1):
+                # Crop from raw image (row-1)*55 starting at y=5 for row 1
+                y_offset = (row - 1) * 55 + 5
+                x_offset = (col - 1) * 140
+
+                cell_img = img.crop((
+                    x_offset, y_offset,
+                    x_offset + cell_w, y_offset + cell_h
+                ))
+
+                key = base64.b64encode(f"{col}x{row}".encode()).decode()
+                num = (row - 1) * bx + col
+
+                cells.append({
+                    "col": col,
+                    "row": row,
+                    "getNum": num,
+                    "key": key,
+                    "image": cell_img,
+                    "bg_position": f"{-140*(col-1)}px {-55*(row-1)-5}px",
+                })
+
+                # Save cell for inspection
+                cell_path = f"/tmp/xc_cell_{col}x{row}.png"
+                cell_img.save(cell_path)
+
+        # Also extract instruction area (y=220, h=90 in rendered, y=220 in raw)
+        instr_img = img.crop((0, 220, 280, 320))
+        instr_img.save("/tmp/xc_instruction.png")
+
+        print(f"  Grid: {bx}×{by}, {len(cells)} cells extracted")
+        print(f"  Instruction area saved to /tmp/xc_instruction.png")
+        return cells
+
+    def extract_instruction_text(self, task: dict) -> str:
+        """
+        The text-type instruction is rendered in the image at bg-position 0px -220px.
+        The known English instruction is:
+          "Assemble from 2 elements the same code as shown above"
+        """
+        return "Assemble from 2 elements the same code as shown above"
 
     # ── CUSTOM type solver ──
 
@@ -194,13 +327,6 @@ class XcaptchaClient:
         """
         EXPLOIT: The /task API LEAKS the ground-truth coordinates in the
         `coords` field! No image recognition needed.
-
-        The `coords` array contains objects with:
-            letter: the symbol (e.g. "M", "%", "☘", "$")
-            x:      click X coordinate (float)
-            y:      click Y coordinate (float)
-
-        We just format them as [{x, y}, ...] and base64-encode.
         """
         coords = task.get("coords", [])
         if not coords:
@@ -214,7 +340,6 @@ class XcaptchaClient:
         for c in coords:
             print(f"    Find {c['letter']} at ({c['x']:.1f}, {c['y']:.1f})")
 
-        # Format as clicks array: [{x, y}, ...] in order
         clicks = [{"x": c["x"], "y": c["y"]} for c in coords]
         answer = format_custom_answer(clicks)
 
@@ -235,7 +360,10 @@ class XcaptchaClient:
     # ── Main solve entry point ──
 
     async def solve(self) -> dict:
-        """Fetch task and solve it using leaked API data."""
+        """Fetch task and solve it."""
+        if not self.captcha_session:
+            await self.init_session()
+
         task = await self.get_task()
         task_type = task.get("type", "unknown")
         print(f"\n{'='*50}")
@@ -243,21 +371,37 @@ class XcaptchaClient:
         print(f"Site key:  {self.site_key}")
 
         if task_type == "text":
-            result = self.solve_text_leaked(task)
-            return {"type": "text", "cells": result, "task_key": task["key"]}
+            cells = self.extract_text_cells(task)
+            instruction = self.extract_instruction_text(task)
+
+            print(f"\n  Instruction: \"{instruction}\"")
+            print(f"  Select 2 cells that match the reference emoji")
+            print(f"  Cells saved to /tmp/xc_cell_*.png")
+            print(f"  Reference saved to /tmp/xc_instruction.png")
+            print(f"\n  Answer format: btoa(JSON.stringify({{btoa(col+'x'+row): getNum}}))")
+            print(f"  Submit: GET /captcha/{{siteKey}}/task/{{answer}}")
+            print(f"  With headers: Wcaptcha-Key={task['key']}")
+
+            return {"type": "text", "cells": cells, "task_key": task["key"],
+                    "instruction": instruction, "format": "see format_text_answer()"}
 
         elif task_type == "custom":
             answer = self.solve_custom_leaked(task)
-            return {"type": "custom", "answer": answer, "task_key": task["key"]}
+            result = await self.check_answer(answer)
+            return {"type": "custom", "answer": answer, "result": result,
+                    "task_key": task["key"]}
 
         elif task_type == "empty":
             answer = self.solve_empty_leaked(task)
-            return {"type": "empty", "answer": answer, "task_key": task["key"]}
+            result = await self.check_answer(answer)
+            return {"type": "empty", "answer": answer, "result": result,
+                    "task_key": task["key"]}
 
         elif task_type == "dynamics":
             print("  Dynamics type uses WebSocket — requires browser automation")
             print(f"  Socket endpoint: {task.get('socket', 'N/A')}")
-            return {"type": "dynamics", "note": "WebSocket-based, needs browser", "task_key": task.get("key")}
+            return {"type": "dynamics", "note": "WebSocket-based, needs browser",
+                    "task_key": task.get("key")}
 
         else:
             print(f"  Unknown type: {task_type}")
@@ -270,7 +414,6 @@ class XcaptchaClient:
 
 async def main():
     target = sys.argv[1] if len(sys.argv) > 1 else "all"
-
     types_to_solve = ["text", "custom", "empty"] if target == "all" else [target]
 
     for t in types_to_solve:
@@ -280,7 +423,11 @@ async def main():
 
         async with XcaptchaClient(site_type=t) as client:
             result = await client.solve()
-            print(f"\nResult: {json.dumps({k: v for k, v in result.items() if k != 'cells'}, indent=2)}")
+            # Don't print raw cell data — just summary
+            summary = {k: v for k, v in result.items()
+                       if k not in ("cells", "raw")}
+            print(f"\nResult: {json.dumps(summary, indent=2, default=str)}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
